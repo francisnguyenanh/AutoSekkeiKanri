@@ -93,7 +93,7 @@ namespace AutoFiller.UIDriver
 
         // ── constructors ──────────────────────────────────────────────────
 
-        public VisionSnapshotDumper() : this(new OcrEngine()) { }
+        public VisionSnapshotDumper() : this(OcrEngineProvider.Instance) { }
 
         public VisionSnapshotDumper(OcrEngine ocrEngine)
         {

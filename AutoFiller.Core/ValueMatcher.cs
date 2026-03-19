@@ -1,5 +1,6 @@
 // References types from:
-//   AutoFiller.UIDriver  (AppSnapshot, ControlSnapshot, GridRow, GridCell, GridSnapshot, TabSnapshot)
+//   AutoFiller.UIDriver  (VisionSnapshot, TabVisionSnapshot, LabelValuePair,
+//                         GridVisionSnapshot, GridRowSnapshot, GridCellSnapshot)
 //   AutoFiller.Core      (ExcelCellValue, ItemRowValues, ExcelValueExtractor)
 
 using System;
@@ -58,6 +59,12 @@ namespace AutoFiller.Core
         public string GridColumnHeader { get; set; }
         public int ExcelColIndex { get; set; }
         public string ExcelColLetter { get; set; }
+        /// <summary>
+        /// Volatile screen X-coordinate of the column centre. Not persisted to JSON
+        /// (depends on current window position). Repopulate via
+        /// <c>VisionInteractor.RefreshGridColumnPositions()</c> after loading from JSON.
+        /// </summary>
+        [System.Text.Json.Serialization.JsonIgnore]
         public double GridColumnX { get; set; }
         public string CellType { get; set; }
     }
@@ -114,7 +121,7 @@ namespace AutoFiller.Core
         /// against <paramref name="excelValues"/> and produces a
         /// <see cref="MappingConfig"/> describing the discovered mappings.
         /// </summary>
-        public MappingConfig Match(AppSnapshot snapshot, List<ExcelCellValue> excelValues)
+        public MappingConfig Match(VisionSnapshot snapshot, List<ExcelCellValue> excelValues)
         {
             if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
             if (excelValues == null) throw new ArgumentNullException(nameof(excelValues));
@@ -132,17 +139,22 @@ namespace AutoFiller.Core
             var headerMatches = new List<MatchResult>();
             var matchedExcelAddresses = new HashSet<string>(StringComparer.Ordinal);
 
-            // Flat list = all controls, not just header section ones.
-            // We distinguish grid vs. non-grid by TabSnapshot.Grid presence.
+            // Build a flat list of all label-value pairs with their tab context.
+            // We distinguish grid vs. non-grid by TabVisionSnapshot.Grid presence.
+            var allLabelValues = snapshot.Tabs
+                .SelectMany(t => t.LabeledFields
+                    .Select(p => (TabName: t.TabName ?? string.Empty, Pair: p)))
+                .ToList();
+
             var gridControlNames = BuildGridControlNameSet(snapshot);
 
-            foreach (var ctrl in snapshot.Controls)
+            foreach (var entry in allLabelValues)
             {
-                string rawValue = ctrl.CurrentValue ?? string.Empty;
+                string rawValue = entry.Pair.ValueText ?? string.Empty;
                 if (string.IsNullOrWhiteSpace(rawValue)) continue;
 
-                // Skip controls whose value lives inside a detected grid.
-                if (gridControlNames.Contains(ctrl.Name ?? string.Empty)) continue;
+                // Skip label-value pairs whose label appears in a detected grid.
+                if (gridControlNames.Contains(entry.Pair.LabelText ?? string.Empty)) continue;
 
                 string norm = _extractor.Normalize(rawValue);
                 if (!IsMatchableValue(norm, occurrenceCounts)) continue;
@@ -165,18 +177,18 @@ namespace AutoFiller.Core
 
                 headerMatches.Add(new MatchResult
                 {
-                    ControlName = ctrl.Name ?? string.Empty,
-                    TabContext = ctrl.TabContext ?? string.Empty,
-                    ControlPath = BuildPath(snapshot, ctrl),
-                    ControlX = ctrl.Bounds?.CenterX ?? 0,
-                    ControlY = ctrl.Bounds?.CenterY ?? 0,
-                    ExcelSheet = best.SheetName,
+                    ControlName      = entry.Pair.LabelText ?? string.Empty,
+                    TabContext        = entry.TabName,
+                    ControlPath      = entry.Pair.LabelText ?? string.Empty,
+                    ControlX         = entry.Pair.ClickX,
+                    ControlY         = entry.Pair.ClickY,
+                    ExcelSheet       = best.SheetName,
                     ExcelCellAddress = best.CellAddress,
-                    ExcelRow = best.Row,
-                    ExcelCol = best.Col,
-                    MatchedValue = rawValue,
-                    ConfidenceScore = confidence,
-                    Type = MatchType.ExactMatch
+                    ExcelRow         = best.Row,
+                    ExcelCol         = best.Col,
+                    MatchedValue     = rawValue,
+                    ConfidenceScore  = confidence,
+                    Type             = MatchType.ExactMatch
                 });
             }
 
@@ -215,17 +227,17 @@ namespace AutoFiller.Core
             var matchedControlNames = new HashSet<string>(
                 headerFields.Select(f => f.ControlName), StringComparer.Ordinal);
 
-            var unmatchedControls = snapshot.Controls
-                .Where(c => !string.IsNullOrWhiteSpace(c.CurrentValue)
-                            && !gridControlNames.Contains(c.Name ?? string.Empty)
-                            && !matchedControlNames.Contains(c.Name ?? string.Empty))
-                .Select(c => new UnmatchedControl
+            var unmatchedControls = allLabelValues
+                .Where(e => !string.IsNullOrWhiteSpace(e.Pair.ValueText)
+                            && !gridControlNames.Contains(e.Pair.LabelText ?? string.Empty)
+                            && !matchedControlNames.Contains(e.Pair.LabelText ?? string.Empty))
+                .Select(e => new UnmatchedControl
                 {
-                    ControlName = c.Name ?? string.Empty,
-                    TabContext = c.TabContext ?? string.Empty,
-                    CurrentValue = c.CurrentValue,
-                    X = c.Bounds?.CenterX ?? 0,
-                    Y = c.Bounds?.CenterY ?? 0
+                    ControlName  = e.Pair.LabelText ?? string.Empty,
+                    TabContext    = e.TabName,
+                    CurrentValue = e.Pair.ValueText,
+                    X            = e.Pair.ClickX,
+                    Y            = e.Pair.ClickY
                 })
                 .ToList();
 
@@ -416,7 +428,7 @@ namespace AutoFiller.Core
         /// Returns (-1, 0.0) when no plausible match is found.
         /// </summary>
         private (int excelRow, double score) MatchGridRow(
-            GridRow gridRow,
+            GridRowSnapshot gridRow,
             List<ItemRowValues> excelItems)
         {
             if (gridRow?.Cells == null || gridRow.Cells.Count == 0)
@@ -462,21 +474,30 @@ namespace AutoFiller.Core
         // ── private: grid mapping builder ─────────────────────────────────────
 
         private GridMapping BuildGridMapping(
-            AppSnapshot snapshot,
+            VisionSnapshot snapshot,
             List<ItemRowValues> excelItemRows,
             List<ExcelCellValue> excelValues)
         {
             // Find the first tab that has a detected grid.
-            TabSnapshot tabWithGrid = snapshot.Tabs?.FirstOrDefault(t => t.Grid != null);
+            TabVisionSnapshot tabWithGrid = snapshot.Tabs?.FirstOrDefault(t => t.Grid != null);
             if (tabWithGrid == null) return null;
 
             var grid = tabWithGrid.Grid;
+
+            // Derive per-column X positions from the first data row's cells.
+            var colXPositions = grid.Rows.Count > 0
+                ? grid.Rows[0].Cells.ToDictionary(
+                    c => c.ColumnHeader ?? string.Empty,
+                    c => (double)c.X,
+                    StringComparer.Ordinal)
+                : new Dictionary<string, double>();
+
             var mapping = new GridMapping
             {
-                GridOriginX = grid.GridOriginX,
-                GridOriginY = grid.GridOriginY,
-                RowHeight = grid.RowHeight,
-                TabContext = tabWithGrid.TabName ?? string.Empty
+                GridOriginX = colXPositions.Values.FirstOrDefault(),
+                GridOriginY = grid.FirstDataRowY,
+                RowHeight   = grid.RowHeight,
+                TabContext   = tabWithGrid.TabName ?? string.Empty
             };
 
             if (grid.Rows.Count == 0 || excelItemRows.Count == 0)
@@ -538,9 +559,7 @@ namespace AutoFiller.Core
                     ? LetterToColIndex(winnerLetter)
                     : 1;   // fallback
 
-                // Derive screen X from the corresponding GridColumn definition.
-                double screenX = grid.Columns
-                    .FirstOrDefault(c => c.HeaderText == gridHdr)?.X ?? 0;
+                colXPositions.TryGetValue(gridHdr, out double screenX);
 
                 mapping.Columns[gridHdr] = new GridColumnMapping
                 {
@@ -576,45 +595,18 @@ namespace AutoFiller.Core
         /// Builds the set of control names that belong to a grid (so they are
         /// excluded from header-field matching).
         /// </summary>
-        private static HashSet<string> BuildGridControlNameSet(AppSnapshot snapshot)
+        private static HashSet<string> BuildGridControlNameSet(VisionSnapshot snapshot)
         {
-            var names = new HashSet<string>(StringComparer.Ordinal);
-            if (snapshot.Tabs == null) return names;
-
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var tab in snapshot.Tabs)
             {
                 if (tab.Grid == null) continue;
                 foreach (var row in tab.Grid.Rows)
-                foreach (var cell in row.Cells)
-                    if (!string.IsNullOrEmpty(cell.Value))
-                        names.Add(cell.Value); // cells are identified by value here as proxy
+                    foreach (var cell in row.Cells)
+                        if (!string.IsNullOrEmpty(cell.Value))
+                            set.Add(cell.Value);
             }
-
-            return names;
-        }
-
-        /// <summary>
-        /// Builds a breadcrumb path for a control by walking the flat list to
-        /// find ancestors via ParentName.
-        /// </summary>
-        private static string BuildPath(AppSnapshot snapshot, ControlSnapshot target)
-        {
-            var parts = new List<string>();
-            string current = target.ParentName ?? string.Empty;
-
-            // Limit depth to avoid infinite loops on malformed data.
-            int limit = 10;
-            while (!string.IsNullOrEmpty(current) && limit-- > 0)
-            {
-                var parent = snapshot.Controls
-                    .FirstOrDefault(c => c.Name == current && c.Depth < target.Depth);
-                if (parent == null) break;
-                parts.Insert(0, parent.Name ?? string.Empty);
-                current = parent.ParentName ?? string.Empty;
-            }
-
-            parts.Add(target.Name ?? string.Empty);
-            return string.Join(" > ", parts.Where(p => !string.IsNullOrEmpty(p)));
+            return set;
         }
 
         private static string InferInputMethod(string value)

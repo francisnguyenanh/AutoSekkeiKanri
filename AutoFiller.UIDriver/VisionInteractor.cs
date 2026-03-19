@@ -2,10 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;   // for Clipboard (STA)
+using Microsoft.Extensions.Logging;
 
 namespace AutoFiller.UIDriver
 {
@@ -45,11 +47,26 @@ namespace AutoFiller.UIDriver
     {
         // ── Win32 imports ─────────────────────────────────────────────────
 
-        [DllImport("user32.dll")]
-        private static extern void mouse_event(uint flags, int x, int y, int data, int extraInfo);
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MOUSEINPUT
+        {
+            public int    dx, dy, mouseData;
+            public uint   dwFlags, time;
+            public IntPtr dwExtraInfo;
+        }
 
-        [DllImport("user32.dll")]
-        private static extern bool SetCursorPos(int x, int y);
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT
+        {
+            public uint      type;
+            public MOUSEINPUT mi;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [DllImport("user32.dll", EntryPoint = "GetSystemMetrics")]
+        private static extern int GetSysMetrics(int nIndex);
 
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hwnd);
@@ -66,10 +83,15 @@ namespace AutoFiller.UIDriver
         [DllImport("user32.dll")]
         private static extern bool GetWindowRect(IntPtr hwnd, out ScreenCapture.RECT rect);
 
-        // mouse_event flags
-        private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
-        private const uint MOUSEEVENTF_LEFTUP   = 0x0004;
-        private const uint MOUSEEVENTF_WHEEL    = 0x0800;
+        // INPUT type
+        private const uint INPUT_MOUSE = 0;
+
+        // MOUSEEVENTF flags
+        private const uint MOUSEEVENTF_MOVE      = 0x0001;
+        private const uint MOUSEEVENTF_LEFTDOWN  = 0x0002;
+        private const uint MOUSEEVENTF_LEFTUP    = 0x0004;
+        private const uint MOUSEEVENTF_WHEEL     = 0x0800;
+        private const uint MOUSEEVENTF_ABSOLUTE  = 0x8000;
 
         // keybd_event flags
         private const uint KEYEVENTF_KEYUP = 0x0002;
@@ -90,31 +112,35 @@ namespace AutoFiller.UIDriver
         // Mouse wheel delta: one notch = 120 WHEEL_DELTA units
         private const int WHEEL_DELTA = 120;
 
-        // How long to wait after a click before proceeding (ms).
-        private const int DefaultClickDelayMs = 80;
-
         // ── fields ────────────────────────────────────────────────────────
 
         private readonly ScreenCapture _screen;
         private readonly OcrEngine _ocr;
+        private readonly TimingConfig _timing;
+        private readonly ILogger<VisionInteractor> _logger;
         private IntPtr _hwnd = IntPtr.Zero;
 
         // Cached grid layout (invalidated on tab change).
         private GridLayout _cachedGrid;
 
+        // Column header → cell type ("text" | "dropdown"). Populated via SetColumnCellTypes().
+        private IReadOnlyDictionary<string, string> _columnCellTypes;
+
         public VisionInteractor()
+            : this(OcrEngineProvider.Instance) { }
+
+        public VisionInteractor(
+            OcrEngine ocr,
+            TimingConfig timing = null,
+            ILogger<VisionInteractor> logger = null)
         {
             _screen = new ScreenCapture();
-            _ocr    = new OcrEngine();          // Japanese OCR
+            _ocr    = ocr ?? OcrEngineProvider.Instance;
+            _timing = timing ?? TimingConfig.Default;
+            _logger = logger ?? NullLogger<VisionInteractor>.Instance;
         }
 
-        public VisionInteractor(OcrEngine ocrEngine)
-        {
-            _screen = new ScreenCapture();
-            _ocr    = ocrEngine ?? throw new ArgumentNullException(nameof(ocrEngine));
-        }
-
-        // ── public: attach ────────────────────────────────────────────────
+        // ── public: attach ── + mapping hints ─────────────────────────────
 
         /// <summary>
         /// Finds the app window by partial title match and stores its handle.
@@ -131,24 +157,42 @@ namespace AutoFiller.UIDriver
             return _hwnd != IntPtr.Zero;
         }
 
+        /// <summary>
+        /// Provides per-column cell-type hints used by <see cref="FillGridCell"/>
+        /// to choose between clipboard paste and dropdown selection.
+        /// Keys are column header strings (case-insensitive match).
+        /// Values should be <c>"text"</c> or <c>"dropdown"</c>.
+        /// </summary>
+        public void SetColumnCellTypes(IReadOnlyDictionary<string, string> types)
+        {
+            _columnCellTypes = types;
+        }
+
         // ── public: high-level ────────────────────────────────────────────
 
         /// <summary>
         /// Finds <paramref name="labelText"/> via OCR, clicks the adjacent
         /// input field, selects all existing content, then pastes
-        /// <paramref name="value"/>.  Optionally verifies the fill with a
-        /// second OCR pass.
+        /// <paramref name="value"/>. Retries up to 3 times on failure.
         /// </summary>
         /// <returns>
         /// True when the value is visible in the area after filling;
-        /// false when the label was not found or verification failed.
+        /// false when the label was not found after all retry attempts.
         /// </returns>
         public async Task<bool> FillFieldByLabel(
             string labelText,
             string value,
             FieldPosition fieldPosition = FieldPosition.Right)
+            => await RetryAsync(() => FillFieldByLabelOnce(labelText, value, fieldPosition));
+
+        private async Task<bool> FillFieldByLabelOnce(
+            string labelText,
+            string value,
+            FieldPosition fieldPosition)
         {
             EnsureAttached();
+
+            _logger.LogDebug("Searching for label '{Label}'", labelText);
 
             // 1. Capture + OCR
             using Bitmap bmp = _screen.CaptureWindow(_hwnd);
@@ -156,12 +200,19 @@ namespace AutoFiller.UIDriver
 
             // 2. Locate the input field next to the label
             Point? fieldPoint = _ocr.FindInputFieldNearLabel(ocr, labelText, fieldPosition, offset: 8);
-            if (!fieldPoint.HasValue) return false;
+            if (!fieldPoint.HasValue)
+            {
+                _logger.LogWarning("Label '{Label}' not found in screenshot", labelText);
+                return false;
+            }
 
             // 3. Translate bitmap-relative coords to absolute screen coords
             Rectangle winBounds = _screen.GetWindowBounds(_hwnd);
             int screenX = winBounds.Left + fieldPoint.Value.X;
             int screenY = winBounds.Top  + fieldPoint.Value.Y;
+
+            _logger.LogDebug("Label '{Label}' found, clicking field at ({FX},{FY})",
+                labelText, screenX, screenY);
 
             // 4. Click → SelectAll → Paste
             BringWindowToFront();
@@ -211,14 +262,25 @@ namespace AutoFiller.UIDriver
 
         /// <summary>
         /// Fills a single grid cell identified by its column header text and
-        /// 0-based row index.
+        /// 0-based row index. Retries up to 3 times on failure.
+        /// Uses dropdown selection for columns flagged as <c>"dropdown"</c>
+        /// via <see cref="SetColumnCellTypes"/>.
         /// </summary>
         public async Task<bool> FillGridCell(
             int rowIndex,
             string columnHeaderText,
             string value)
+            => await RetryAsync(() => FillGridCellOnce(rowIndex, columnHeaderText, value));
+
+        private async Task<bool> FillGridCellOnce(
+            int rowIndex,
+            string columnHeaderText,
+            string value)
         {
             EnsureAttached();
+
+            _logger.LogDebug("Filling grid row={Row} col='{Col}' value='{Val}'",
+                rowIndex, columnHeaderText, value);
 
             GridLayout layout = _cachedGrid ?? await DetectGrid();
             if (layout == null) return false;
@@ -227,11 +289,19 @@ namespace AutoFiller.UIDriver
             GridColumn col = layout.Columns.FirstOrDefault(
                 c => c.HeaderText != null &&
                      c.HeaderText.Contains(columnHeaderText, StringComparison.OrdinalIgnoreCase));
-            if (col == null) return false;
+            if (col == null)
+            {
+                _logger.LogWarning("Grid column '{Col}' not found in layout", columnHeaderText);
+                return false;
+            }
 
             int cellScreenX = col.CenterX;
             int cellScreenY = layout.FirstDataRowY + rowIndex * layout.RowHeight
                               + layout.RowHeight / 2;
+
+            // Use dropdown selection when the column is flagged as "dropdown".
+            if (GetCellType(columnHeaderText) == "dropdown")
+                return await SelectDropdownValue(cellScreenX, cellScreenY, value);
 
             BringWindowToFront();
             await ClickAt(cellScreenX, cellScreenY);
@@ -263,10 +333,10 @@ namespace AutoFiller.UIDriver
             if (ocr.Words.Count == 0) return null;
 
             // Group words by approximate Y band (±8 px tolerance).
-            var bands = GroupByY(ocr.Words, tolerance: 8);
+            var bands = OcrUtils.GroupByY(ocr.Words, 8);
 
             // The header row is the band with the highest density of evenly-spaced words.
-            List<OcrWord> headerBand = FindHeaderBand(bands);
+            List<OcrWord> headerBand = OcrUtils.FindHeaderBand(bands);
             if (headerBand == null || headerBand.Count < 2) return null;
 
             int headerBitmapY = headerBand.Average(w => w.BoundingBox.Top + w.BoundingBox.Height / 2.0)
@@ -335,6 +405,101 @@ namespace AutoFiller.UIDriver
             }
         }
 
+        // ── public: dropdown ──────────────────────────────────────────────
+
+        /// <summary>
+        /// Clicks (<paramref name="screenX"/>, <paramref name="screenY"/>) to open
+        /// a dropdown/combobox, then polls the region below the click for up to
+        /// <paramref name="timeoutMs"/> ms until OCR finds <paramref name="targetValue"/>
+        /// in the popup list, and clicks the matching option.
+        /// </summary>
+        /// <returns>True when the option was found and clicked; false on timeout.</returns>
+        public async Task<bool> SelectDropdownValue(
+            int screenX, int screenY,
+            string targetValue,
+            int timeoutMs = 2000)
+        {
+            EnsureAttached();
+
+            _logger.LogDebug("Opening dropdown at ({X},{Y}), looking for '{Val}'",
+                screenX, screenY, targetValue);
+
+            await ClickAt(screenX, screenY);
+            await Task.Delay(200);
+
+            // Search in a region below the click point for the popup list.
+            var searchRegion = new Rectangle(screenX - 100, screenY, 200, 300);
+            var sw = Stopwatch.StartNew();
+
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                Rectangle winBounds = _screen.GetWindowBounds(_hwnd);
+                var winRelRegion = new Rectangle(
+                    searchRegion.X - winBounds.Left,
+                    searchRegion.Y - winBounds.Top,
+                    searchRegion.Width,
+                    searchRegion.Height);
+                winRelRegion.Intersect(new Rectangle(0, 0, winBounds.Width, winBounds.Height));
+
+                if (winRelRegion.Width > 0 && winRelRegion.Height > 0)
+                {
+                    using var regionBmp = _screen.CaptureRegion(_hwnd, winRelRegion);
+                    OcrResult popupOcr = await _ocr.RecognizeAsync(regionBmp);
+
+                    OcrWord match = _ocr.FindText(popupOcr, targetValue);
+                    if (match != null)
+                    {
+                        int absX = searchRegion.X + match.BoundingBox.Left + match.BoundingBox.Width  / 2;
+                        int absY = searchRegion.Y + match.BoundingBox.Top  + match.BoundingBox.Height / 2;
+                        await ClickAt(absX, absY);
+                        return true;
+                    }
+                }
+
+                await Task.Delay(200);
+            }
+
+            _logger.LogWarning("Dropdown option '{Val}' not found within {Timeout}ms",
+                targetValue, timeoutMs);
+            return false;
+        }
+
+        /// <summary>
+        /// Re-detects grid column positions from the live app screenshot and
+        /// updates <see cref="GridColumnMapping.GridColumnX"/> for every column
+        /// in <paramref name="config"/>. Call this after loading a
+        /// <see cref="MappingConfig"/> from JSON (where <c>GridColumnX</c> was
+        /// not persisted) or when the app window may have moved.
+        /// </summary>
+        public async Task RefreshGridColumnPositions(AutoFiller.Core.MappingConfig config)
+        {
+            if (config?.Grid?.Columns == null) return;
+
+            GridLayout layout = await DetectGrid();
+            if (layout == null)
+            {
+                _logger.LogWarning("RefreshGridColumnPositions: DetectGrid returned null");
+                return;
+            }
+
+            foreach (var kv in config.Grid.Columns)
+            {
+                GridColumn gridCol = layout.Columns.FirstOrDefault(c =>
+                    c.HeaderText != null &&
+                    c.HeaderText.Contains(kv.Key, StringComparison.OrdinalIgnoreCase));
+
+                if (gridCol != null)
+                {
+                    kv.Value.GridColumnX = gridCol.CenterX;
+                    _logger.LogDebug("Refreshed column '{Col}' X → {X}", kv.Key, gridCol.CenterX);
+                }
+                else
+                {
+                    _logger.LogWarning("RefreshGridColumnPositions: column '{Col}' not found in OCR layout", kv.Key);
+                }
+            }
+        }
+
         // ── public: low-level input ───────────────────────────────────────
 
         /// <summary>
@@ -345,24 +510,30 @@ namespace AutoFiller.UIDriver
         {
             EnsureAttached();
             PostMessage(_hwnd, WM_KEYDOWN, (IntPtr)vkKey, IntPtr.Zero);
-            Thread.Sleep(30);
+            Thread.Sleep(_timing.AfterFunctionKeyMs);
             PostMessage(_hwnd, WM_KEYUP,   (IntPtr)vkKey, IntPtr.Zero);
         }
 
         /// <summary>
-        /// Scrolls the app by sending a mouse-wheel event over the current
-        /// cursor position.  Positive <paramref name="deltaRows"/> scrolls up;
-        /// negative scrolls down.
+        /// Scrolls the grid. Positive <paramref name="deltaRows"/> scrolls DOWN
+        /// (shows lower rows). Negative scrolls UP (shows higher rows).
+        /// One unit = one row height ≈ one WHEEL_DELTA notch.
         /// </summary>
         public async Task ScrollGrid(int deltaRows)
         {
             EnsureAttached();
             BringWindowToFront();
-            await Task.Delay(50);
+            await Task.Delay(_timing.ClickSettleMs);
 
-            int wheelData = deltaRows * WHEEL_DELTA;
-            mouse_event(MOUSEEVENTF_WHEEL, 0, 0, wheelData, 0);
-            await Task.Delay(80);
+            // Positive deltaRows = scroll down = NEGATIVE wheel delta.
+            int wheelData = -deltaRows * WHEEL_DELTA;
+            var input = new INPUT
+            {
+                type = INPUT_MOUSE,
+                mi   = new MOUSEINPUT { dwFlags = MOUSEEVENTF_WHEEL, mouseData = wheelData }
+            };
+            SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT)));
+            await Task.Delay(_timing.AfterScrollMs);
         }
 
         // ── private: low-level input ──────────────────────────────────────
@@ -373,12 +544,26 @@ namespace AutoFiller.UIDriver
         /// </summary>
         private async Task ClickAt(int screenX, int screenY)
         {
-            SetCursorPos(screenX, screenY);
-            await Task.Delay(30);
-            mouse_event(MOUSEEVENTF_LEFTDOWN, screenX, screenY, 0, 0);
-            await Task.Delay(DefaultClickDelayMs);
-            mouse_event(MOUSEEVENTF_LEFTUP,   screenX, screenY, 0, 0);
-            await Task.Delay(DefaultClickDelayMs);
+            int screenW = GetSysMetrics(0);   // SM_CXSCREEN
+            int screenH = GetSysMetrics(1);   // SM_CYSCREEN
+            int normX   = screenX * 65535 / screenW;
+            int normY   = screenY * 65535 / screenH;
+
+            var inputs = new INPUT[]
+            {
+                new INPUT { type = INPUT_MOUSE, mi = new MOUSEINPUT {
+                    dx = normX, dy = normY,
+                    dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE } },
+                new INPUT { type = INPUT_MOUSE, mi = new MOUSEINPUT {
+                    dwFlags = MOUSEEVENTF_LEFTDOWN } },
+                new INPUT { type = INPUT_MOUSE, mi = new MOUSEINPUT {
+                    dwFlags = MOUSEEVENTF_LEFTUP } }
+            };
+
+            BringWindowToFront();
+            await Task.Delay(_timing.ClickSettleMs);
+            SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+            await Task.Delay(_timing.ClickDelayMs);
         }
 
         /// <summary>Sends Ctrl+A to select all text in the focused control.</summary>
@@ -388,7 +573,7 @@ namespace AutoFiller.UIDriver
             keybd_event(VK_A,       0, 0,              0);
             keybd_event(VK_A,       0, KEYEVENTF_KEYUP, 0);
             keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-            Thread.Sleep(30);
+            Thread.Sleep(_timing.SelectAllMs);
         }
 
         /// <summary>
@@ -423,13 +608,13 @@ namespace AutoFiller.UIDriver
                 await tcs.Task;
             }
 
-            await Task.Delay(30);   // give clipboard time to settle
+            await Task.Delay(_timing.ClipboardSettleMs);   // give clipboard time to settle
 
             keybd_event(VK_CONTROL, 0, 0,               0);
             keybd_event(VK_V,       0, 0,               0);
             keybd_event(VK_V,       0, KEYEVENTF_KEYUP,  0);
             keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP,  0);
-            await Task.Delay(60);
+            await Task.Delay(_timing.AfterPasteMs);
         }
 
         // ── private: helpers ──────────────────────────────────────────────
@@ -438,7 +623,7 @@ namespace AutoFiller.UIDriver
         {
             if (_hwnd != IntPtr.Zero)
                 SetForegroundWindow(_hwnd);
-            Thread.Sleep(80);
+            Thread.Sleep(_timing.BringToFrontMs);
         }
 
         private void EnsureAttached()
@@ -449,62 +634,28 @@ namespace AutoFiller.UIDriver
         }
 
         /// <summary>
-        /// Groups OCR words into horizontal bands where all words share roughly
-        /// the same Y centre (within <paramref name="tolerance"/> pixels).
+        /// Retries <paramref name="action"/> up to <paramref name="maxAttempts"/> times,
+        /// waiting <paramref name="retryDelayMs"/> ms between attempts.
+        /// Returns true on first success, false after all attempts exhausted.
         /// </summary>
-        private static List<List<OcrWord>> GroupByY(
-            IEnumerable<OcrWord> words, int tolerance)
+        private static async Task<bool> RetryAsync(
+            Func<Task<bool>> action,
+            int maxAttempts  = 3,
+            int retryDelayMs = 400)
         {
-            var bands = new List<List<OcrWord>>();
-            foreach (var word in words.OrderBy(w => w.BoundingBox.Top))
+            for (int i = 0; i < maxAttempts; i++)
             {
-                int wordCy = word.BoundingBox.Top + word.BoundingBox.Height / 2;
-                var band = bands.FirstOrDefault(b =>
-                {
-                    int bandCy = b[0].BoundingBox.Top + b[0].BoundingBox.Height / 2;
-                    return Math.Abs(wordCy - bandCy) <= tolerance;
-                });
-
-                if (band != null)
-                    band.Add(word);
-                else
-                    bands.Add(new List<OcrWord> { word });
+                bool ok = await action();
+                if (ok) return true;
+                if (i < maxAttempts - 1) await Task.Delay(retryDelayMs);
             }
-            return bands;
+            return false;
         }
 
-        /// <summary>
-        /// Identifies the band most likely to be a column-header row:
-        /// highest word count with even horizontal spacing.
-        /// </summary>
-        private static List<OcrWord> FindHeaderBand(List<List<OcrWord>> bands)
+        private string GetCellType(string columnHeader)
         {
-            List<OcrWord> best = null;
-            double bestScore = -1;
-
-            foreach (var band in bands)
-            {
-                if (band.Count < 2) continue;
-
-                var sorted = band.OrderBy(w => w.BoundingBox.Left).ToList();
-                var gaps = new List<double>();
-                for (int i = 1; i < sorted.Count; i++)
-                    gaps.Add(sorted[i].BoundingBox.Left - sorted[i - 1].BoundingBox.Right);
-
-                double avgGap      = gaps.Average();
-                double gapVariance = gaps.Average(g => Math.Abs(g - avgGap));
-
-                // Score: many words + consistent gaps = likely a header row.
-                double score = band.Count * 2.0 - gapVariance / Math.Max(1, avgGap);
-
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    best = band;
-                }
-            }
-
-            return best;
+            if (_columnCellTypes == null) return "text";
+            return _columnCellTypes.TryGetValue(columnHeader, out string t) ? t ?? "text" : "text";
         }
 
         /// <summary>

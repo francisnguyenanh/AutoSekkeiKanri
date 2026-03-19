@@ -77,7 +77,7 @@ namespace AutoFiller.UIDriver
         {
             _vision = vision ?? throw new ArgumentNullException(nameof(vision));
             _screen = new ScreenCapture();
-            _ocr    = new OcrEngine();
+            _ocr    = OcrEngineProvider.Instance;
         }
 
         public TabNavigator(VisionInteractor vision, OcrEngine ocrEngine)
@@ -87,8 +87,31 @@ namespace AutoFiller.UIDriver
             _ocr    = ocrEngine ?? throw new ArgumentNullException(nameof(ocrEngine));
         }
 
-        /// <summary>The handle of the app window (forwarded from VisionInteractor).</summary>
-        private IntPtr Hwnd => GetHwndFromVision();
+        // ── window handle ─────────────────────────────────────────────
+
+        private IntPtr _hwnd = IntPtr.Zero;
+
+        /// <summary>
+        /// Must be called before any method that interacts with the app window.
+        /// Throws <see cref="ArgumentException"/> when <paramref name="hwnd"/> is Zero.
+        /// </summary>
+        public void SetWindowHandle(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero)
+                throw new ArgumentException("hwnd must not be Zero.", nameof(hwnd));
+            _hwnd = hwnd;
+        }
+
+        private IntPtr Hwnd
+        {
+            get
+            {
+                if (_hwnd == IntPtr.Zero)
+                    throw new InvalidOperationException(
+                        "Call SetWindowHandle() before using TabNavigator.");
+                return _hwnd;
+            }
+        }
 
         // ── public API ────────────────────────────────────────────────────
 
@@ -286,7 +309,7 @@ namespace AutoFiller.UIDriver
             if (topWords.Count == 0) return new List<OcrWord>();
 
             // Group by Y band.
-            var bands = GroupByY(topWords, YBandTolerance);
+            var bands = OcrUtils.GroupByY(topWords, YBandTolerance);
 
             // The tab strip is the band with the most words that are spaced
             // fairly evenly (not just a header title).
@@ -308,7 +331,7 @@ namespace AutoFiller.UIDriver
             var allWords = words.ToList();
             if (allWords.Count < 8) return false;
 
-            var bands = GroupByY(allWords, YBandTolerance);
+            var bands = OcrUtils.GroupByY(allWords, YBandTolerance);
             if (bands.Count < 3) return false;
 
             // Sort bands by Y.
@@ -339,28 +362,6 @@ namespace AutoFiller.UIDriver
             }
 
             return false;
-        }
-
-        /// <summary>
-        /// Groups a word list into horizontal bands by Y-centre proximity.
-        /// </summary>
-        private static List<List<OcrWord>> GroupByY(
-            IEnumerable<OcrWord> words, int tolerance)
-        {
-            var bands = new List<List<OcrWord>>();
-            foreach (var word in words.OrderBy(w => w.BoundingBox.Top))
-            {
-                int cy = word.BoundingBox.Top + word.BoundingBox.Height / 2;
-                var band = bands.FirstOrDefault(b =>
-                {
-                    int bCy = b[0].BoundingBox.Top + b[0].BoundingBox.Height / 2;
-                    return Math.Abs(cy - bCy) <= tolerance;
-                });
-
-                if (band != null) band.Add(word);
-                else              bands.Add(new List<OcrWord> { word });
-            }
-            return bands;
         }
 
         /// <summary>
@@ -401,42 +402,5 @@ namespace AutoFiller.UIDriver
             return result;
         }
 
-        /// <summary>
-        /// Retrieves the window handle from the attached <see cref="VisionInteractor"/>
-        /// via <see cref="ScreenCapture.FindWindowByTitle"/>.  We re-use whatever
-        /// window the interactor last attached to by asking ScreenCapture to query
-        /// the handle field through reflection — or, more simply, by capturing a
-        /// dummy screenshot which will throw if not attached.
-        ///
-        /// Implementation note: <see cref="VisionInteractor"/> exposes no public
-        /// handle property.  We capture the handle lazily by delegating all
-        /// window-handle-requiring operations to objects that already hold it.
-        /// For direct Win32 calls we rely on <see cref="ScreenCapture"/> which
-        /// can locate the window by its current foreground title.
-        /// </summary>
-        private IntPtr GetHwndFromVision()
-        {
-            // Use the ScreenCapture to locate the same window the VisionInteractor
-            // has attached to.  We store the last known hwnd here for subsequent calls.
-            if (_lastHwnd != IntPtr.Zero) return _lastHwnd;
-
-            // Try the foreground window as a sensible default.
-            _lastHwnd = GetForegroundWindowFallback();
-            return _lastHwnd;
-        }
-
-        private IntPtr _lastHwnd = IntPtr.Zero;
-
-        // Allow callers to explicitly supply the hwnd (used by DiscoverAppStructure callers).
-        public void SetWindowHandle(IntPtr hwnd)
-        {
-            _lastHwnd = hwnd;
-        }
-
-        // ── Win32 minimal import needed only here ────────────────────────
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
-
-        private static IntPtr GetForegroundWindowFallback() => GetForegroundWindow();
     }
 }

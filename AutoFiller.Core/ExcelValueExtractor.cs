@@ -9,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using AutoFiller.UIDriver;
 using OfficeOpenXml;
 
 namespace AutoFiller.Core
@@ -212,11 +213,18 @@ namespace AutoFiller.Core
         {
             if (value == null) return string.Empty;
 
-            // 1. Trim ASCII whitespace and full-width space U+3000.
-            value = value.Trim().Trim('\u3000');
+            // 1. Trim + full-width spaces + full-width digits → shared utility.
+            value = OcrUtils.NormalizeValue(value);
 
-            // 2. Full-width to half-width conversion (digits + Latin letters).
-            value = ConvertFullWidthToHalfWidth(value);
+            // 2. Full-width Latin letters → half-width (Excel-specific).
+            var sb = new StringBuilder(value.Length);
+            foreach (char c in value)
+            {
+                if      (c >= '\uFF21' && c <= '\uFF3A') sb.Append((char)(c - '\uFF21' + 'A'));
+                else if (c >= '\uFF41' && c <= '\uFF5A') sb.Append((char)(c - '\uFF41' + 'a'));
+                else sb.Append(c);
+            }
+            value = sb.ToString();
 
             // 3. Lowercase.
             value = value.ToLowerInvariant();
@@ -375,28 +383,6 @@ namespace AutoFiller.Core
                     if (kv.Value.Contains(candidate, StringComparison.Ordinal))
                         return kv.Key;
             return 0;
-        }
-
-        // ── value normalisation ───────────────────────────────────────────────
-
-        private static string ConvertFullWidthToHalfWidth(string s)
-        {
-            var sb = new StringBuilder(s.Length);
-            foreach (char c in s)
-            {
-                // Full-width digits ０–９ (U+FF10–U+FF19)
-                if (c >= '\uFF10' && c <= '\uFF19')
-                    sb.Append((char)(c - '\uFF10' + '0'));
-                // Full-width uppercase Ａ–Ｚ (U+FF21–U+FF3A)
-                else if (c >= '\uFF21' && c <= '\uFF3A')
-                    sb.Append((char)(c - '\uFF21' + 'A'));
-                // Full-width lowercase ａ–ｚ (U+FF41–U+FF5A)
-                else if (c >= '\uFF41' && c <= '\uFF5A')
-                    sb.Append((char)(c - '\uFF41' + 'a'));
-                else
-                    sb.Append(c);
-            }
-            return sb.ToString();
         }
 
         // ── Excel address helpers ─────────────────────────────────────────────

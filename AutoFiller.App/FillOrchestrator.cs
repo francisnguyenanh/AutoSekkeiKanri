@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AutoFiller.Core;
 using AutoFiller.UIDriver;
+using Microsoft.Extensions.Logging;
 
 namespace AutoFiller.App
 {
@@ -59,6 +60,8 @@ namespace AutoFiller.App
         private readonly ExcelValueExtractor _excel;
         private readonly ScreenCapture       _screen;
         private readonly OcrEngine           _ocr;
+        private readonly TimingConfig        _timing;
+        private readonly ILogger<FillOrchestrator> _logger;
         private IntPtr                       _hwnd = IntPtr.Zero;
 
         // ── Run mode ─────────────────────────────────────────────────────
@@ -69,13 +72,17 @@ namespace AutoFiller.App
         public FillOrchestrator(
             VisionInteractor    vision,
             TabNavigator        tabs,
-            ExcelValueExtractor excel)
+            ExcelValueExtractor excel,
+            TimingConfig        timing = null,
+            ILogger<FillOrchestrator> logger = null)
         {
             _vision = vision ?? throw new ArgumentNullException(nameof(vision));
             _tabs   = tabs   ?? throw new ArgumentNullException(nameof(tabs));
             _excel  = excel  ?? throw new ArgumentNullException(nameof(excel));
             _screen = new ScreenCapture();
             _ocr    = new OcrEngine();
+            _timing = timing ?? TimingConfig.Default;
+            _logger = logger ?? NullLogger<FillOrchestrator>.Instance;
         }
 
         // ── Attach ────────────────────────────────────────────────────────
@@ -127,7 +134,7 @@ namespace AutoFiller.App
 
             // ── STEP 2: Press F2 (新規) to start a new record ─────────────
             _vision.SendFunctionKey(VK_F2);
-            await Task.Delay(600, ct);
+            await WaitForNewRecordForm(ct);
 
             // ── STEP 3: Fill header tab ───────────────────────────────────
             await _tabs.NavigateTo(appStructure.HeaderTabName, timeoutMs: 3000);
@@ -139,15 +146,32 @@ namespace AutoFiller.App
                 if (string.IsNullOrEmpty(value)) continue;
 
                 bool ok = await _vision.FillFieldByLabel(hm.ControlName, value);
+                if (!ok)
+                {
+                    _logger.LogWarning("Header field '{Field}' not found after 3 attempts", hm.ControlName);
+                    warnings.Add($"Header field '{hm.ControlName}' not found after 3 attempts");
+                }
                 Report(progress, $"Header: {hm.ControlName} = {value}", ok);
-                await Task.Delay(150, ct);
+                await Task.Delay(_timing.PerCellMs, ct);
             }
 
             // ── STEP 4: Fill grid tab rows ────────────────────────────────
             await _tabs.NavigateTo(appStructure.GridTabName, timeoutMs: 3000);
             await _vision.DetectGrid();   // prime the internal grid cache
 
-            int rowIndex = 0;
+            // Refresh column screen positions in case window moved since mapping was saved.
+            await _vision.RefreshGridColumnPositions(mapping);
+
+            // Provide cell-type hints ("dropdown" vs. "text") to VisionInteractor.
+            if (mapping?.Grid?.Columns != null)
+            {
+                var types = mapping.Grid.Columns
+                    .ToDictionary(
+                        kv => kv.Key,
+                        kv => kv.Value.CellType ?? "text",
+                        StringComparer.OrdinalIgnoreCase);
+                _vision.SetColumnCellTypes(types);
+            }
             int filled   = 0;
             int errors   = 0;
             var warnings = new List<string>();
@@ -169,11 +193,12 @@ namespace AutoFiller.App
                     try
                     {
                         await _vision.FillGridCell(rowIndex, col.Key, value);
-                        await Task.Delay(120, ct);
+                        await Task.Delay(_timing.PerCellMs, ct);
                         filled++;
                     }
                     catch (Exception ex)
                     {
+                        _logger.LogWarning(ex, "Row {Row} col '{Col}' fill failed", rowIndex, col.Key);
                         warnings.Add($"Row {rowIndex} col {col.Key}: {ex.Message}");
                         errors++;
                     }
@@ -192,6 +217,34 @@ namespace AutoFiller.App
             _vision.SendFunctionKey(VK_F9);
             string confirmMsg = await WaitForConfirmationDialog();
             return new FillResult(true, filled, errors, warnings, confirmMsg);
+        }
+
+        // ── New-record form detection ──────────────────────────────────────
+
+        /// <summary>
+        /// After pressing F2 (新規), polls OCR every 300 ms until the form is
+        /// ready: two consecutive screenshots with the same word count indicate
+        /// the UI has stabilised. Falls through on timeout after
+        /// <paramref name="timeoutMs"/> ms.
+        /// </summary>
+        private async Task WaitForNewRecordForm(CancellationToken ct, int timeoutMs = 5000)
+        {
+            int elapsed       = 0;
+            int prevWordCount = -1;
+
+            while (elapsed < timeoutMs)
+            {
+                await Task.Delay(300, ct);
+                elapsed += 300;
+
+                using var bmp  = _screen.CaptureWindow(_hwnd);
+                OcrResult ocr  = await _ocr.RecognizeAsync(bmp);
+
+                // Stable word count → form has finished loading.
+                if (ocr.Words.Count == prevWordCount) return;
+                prevWordCount = ocr.Words.Count;
+            }
+            // Timeout: proceed anyway.
         }
 
         // ── Confirmation polling ──────────────────────────────────────────
@@ -220,7 +273,7 @@ namespace AutoFiller.App
                     return confirm.Text;
                 }
 
-                await Task.Delay(300);
+                await Task.Delay(_timing.VerifyPollMs);
             }
 
             return "Timeout waiting for confirmation";
