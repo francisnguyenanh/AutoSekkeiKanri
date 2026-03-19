@@ -1,0 +1,308 @@
+<Window x:Class="AutoFiller.App.MappingReviewWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:AutoFiller.App"
+        Title="Mapping Review"
+        Width="1100" Height="720"
+        MinWidth="900" MinHeight="560"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Yu Gothic UI, Segoe UI, sans-serif"
+        FontSize="13">
+
+    <Window.Resources>
+
+        <!-- ── Status colours ─────────────────────────────────────────────── -->
+        <SolidColorBrush x:Key="MatchedBrush"        Color="#27AE60"/>
+        <SolidColorBrush x:Key="LowConfidenceBrush"  Color="#F39C12"/>
+        <SolidColorBrush x:Key="UnmatchedBrush"      Color="#E74C3C"/>
+        <SolidColorBrush x:Key="HeaderBrush"         Color="#2C3E50"/>
+        <SolidColorBrush x:Key="PanelBg"             Color="#F5F6FA"/>
+        <SolidColorBrush x:Key="BorderBrush"         Color="#D5D8DC"/>
+
+        <!-- ── ControlNode → glyph foreground ────────────────────────────── -->
+        <local:StatusToColorConverter x:Key="StatusColor"/>
+
+        <!-- ── ExcelCellRow → row background ─────────────────────────────── -->
+        <local:UsedToBrushConverter x:Key="UsedBrush"/>
+
+        <!-- ── TreeView item style with colour glyph ─────────────────────── -->
+        <Style x:Key="TreeNodeStyle" TargetType="TreeViewItem">
+            <Setter Property="IsExpanded" Value="True"/>
+            <Setter Property="Padding" Value="2,2"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                    <Setter Property="Background" Value="#D6EAF8"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- ── Button base ───────────────────────────────────────────────── -->
+        <Style x:Key="ActionButton" TargetType="Button">
+            <Setter Property="Padding" Value="12,5"/>
+            <Setter Property="Margin" Value="4,2"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+
+    </Window.Resources>
+
+    <Window.DataContext>
+        <local:MappingReviewViewModel/>
+    </Window.DataContext>
+
+    <DockPanel LastChildFill="True">
+
+        <!-- ════════════════════════════════════════════════════════════════
+             BOTTOM TOOLBAR
+             ════════════════════════════════════════════════════════════════ -->
+        <Border DockPanel.Dock="Bottom"
+                Background="{StaticResource HeaderBrush}"
+                Padding="10,6">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- Stats -->
+                <TextBlock Grid.Column="0"
+                           Text="{Binding StatsText}"
+                           Foreground="White"
+                           VerticalAlignment="Center"
+                           FontWeight="SemiBold"/>
+
+                <!-- Buttons -->
+                <StackPanel Grid.Column="1"
+                            Orientation="Horizontal"
+                            VerticalAlignment="Center">
+
+                    <Button Content="Auto-match remaining"
+                            Style="{StaticResource ActionButton}"
+                            Background="#2980B9" Foreground="White"
+                            BorderBrush="#2471A3"
+                            Command="{Binding AutoMatchRemainingCommand}"/>
+
+                    <Button Content="Export mapping.json"
+                            Style="{StaticResource ActionButton}"
+                            Background="#27AE60" Foreground="White"
+                            BorderBrush="#1E8449"
+                            Command="{Binding ExportMappingCommand}"/>
+
+                    <Button Content="Export report"
+                            Style="{StaticResource ActionButton}"
+                            Background="#8E44AD" Foreground="White"
+                            BorderBrush="#7D3C98"
+                            Command="{Binding ExportReportCommand}"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ════════════════════════════════════════════════════════════════
+             MAIN 3-COLUMN AREA
+             ════════════════════════════════════════════════════════════════ -->
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <!-- Left: control tree (220 px, resizable) -->
+                <ColumnDefinition Width="220" MinWidth="150"/>
+                <ColumnDefinition Width="5"/>
+                <!-- Center: detail panel (flexible) -->
+                <ColumnDefinition Width="*" MinWidth="250"/>
+                <ColumnDefinition Width="5"/>
+                <!-- Right: Excel values (220 px, resizable) -->
+                <ColumnDefinition Width="220" MinWidth="150"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- ── LEFT: App Controls Tree ─────────────────────────────── -->
+            <Border Grid.Column="0"
+                    Background="{StaticResource PanelBg}"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="0,0,1,0">
+                <DockPanel>
+                    <TextBlock DockPanel.Dock="Top"
+                               Text="App Controls"
+                               Background="{StaticResource HeaderBrush}"
+                               Foreground="White"
+                               FontWeight="SemiBold"
+                               Padding="8,5"/>
+
+                    <TreeView ItemsSource="{Binding ControlTree}"
+                              BorderThickness="0"
+                              Background="Transparent"
+                              SelectedItemChanged="TreeView_SelectedItemChanged">
+                        <TreeView.ItemContainerStyle>
+                            <Style TargetType="TreeViewItem" BasedOn="{StaticResource TreeNodeStyle}"/>
+                        </TreeView.ItemContainerStyle>
+
+                        <TreeView.Resources>
+                            <!-- Header (Tab) template -->
+                            <HierarchicalDataTemplate DataType="{x:Type local:ControlNode}"
+                                                      ItemsSource="{Binding Children}">
+                                <StackPanel Orientation="Horizontal" Margin="0,1">
+                                    <!-- Glyph coloured by status -->
+                                    <TextBlock Text="{Binding StatusGlyph}"
+                                               Foreground="{Binding Status, Converter={StaticResource StatusColor}}"
+                                               FontWeight="Bold"
+                                               Width="16"
+                                               Visibility="{Binding IsLeaf, Converter={x:Static local:BoolToVisibilityConverter.Instance}}"/>
+                                    <TextBlock Text="{Binding DisplayName}"
+                                               FontWeight="{Binding IsHeader, Converter={x:Static local:BoolToFontWeightConverter.Instance}}"
+                                               ToolTip="{Binding CurrentValue}"/>
+                                    <TextBlock Text=" "
+                                               Visibility="{Binding IsLeaf, Converter={x:Static local:BoolToVisibilityConverter.Instance}}"/>
+                                    <TextBlock Text="{Binding MatchedCell}"
+                                               Foreground="Gray"
+                                               FontSize="11"
+                                               Visibility="{Binding IsLeaf, Converter={x:Static local:BoolToVisibilityConverter.Instance}}"/>
+                                </StackPanel>
+                            </HierarchicalDataTemplate>
+                        </TreeView.Resources>
+                    </TreeView>
+                </DockPanel>
+            </Border>
+
+            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch"
+                          Background="{StaticResource BorderBrush}" ResizeBehavior="PreviousAndNext"/>
+
+            <!-- ── CENTER: Match Detail ────────────────────────────────── -->
+            <Border Grid.Column="2" Padding="16" Background="White">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <TextBlock Text="Match Detail"
+                                   FontSize="15" FontWeight="Bold"
+                                   Foreground="{StaticResource HeaderBrush}"
+                                   Margin="0,0,0,12"/>
+
+                        <!-- No selection placeholder -->
+                        <TextBlock Text="Select a control on the left to see details."
+                                   Foreground="Gray" FontStyle="Italic"
+                                   Visibility="{Binding HasDetail, Converter={x:Static local:InverseBoolToVisibilityConverter.Instance}}"/>
+
+                        <!-- Detail content -->
+                        <StackPanel Visibility="{Binding HasDetail, Converter={x:Static local:BoolToVisibilityConverter.Instance}}">
+
+                            <Grid Margin="0,0,0,16">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="130"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="8"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <TextBlock Grid.Row="0" Grid.Column="0" Text="Control name:"  FontWeight="SemiBold" Margin="0,3"/>
+                                <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding DetailControlName}" Margin="0,3"/>
+
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="Tab:"           FontWeight="SemiBold" Margin="0,3"/>
+                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding DetailTabContext}" Margin="0,3"/>
+
+                                <TextBlock Grid.Row="2" Grid.Column="0" Text="Screen position:" FontWeight="SemiBold" Margin="0,3"/>
+                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding DetailPosition}" Margin="0,3"/>
+
+                                <TextBlock Grid.Row="3" Grid.Column="0" Text="Current value:" FontWeight="SemiBold" Margin="0,3"/>
+                                <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding DetailCurrentValue}"
+                                           TextWrapping="Wrap" Margin="0,3"/>
+
+                                <!-- separator -->
+                                <Separator Grid.Row="4" Grid.ColumnSpan="2" Margin="0,4"/>
+
+                                <TextBlock Grid.Row="5" Grid.Column="0" Text="Excel cell:"   FontWeight="SemiBold" Margin="0,3"/>
+                                <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding DetailExcelCell}" Margin="0,3"/>
+
+                                <TextBlock Grid.Row="6" Grid.Column="0" Text="Excel value:"  FontWeight="SemiBold" Margin="0,3"/>
+                                <TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding DetailExcelValue}"
+                                           TextWrapping="Wrap" Margin="0,3"/>
+
+                                <TextBlock Grid.Row="7" Grid.Column="0" Text="Confidence:"   FontWeight="SemiBold" Margin="0,3"/>
+                                <TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding DetailConfidence}" Margin="0,3"/>
+                            </Grid>
+
+                            <!-- Action buttons -->
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                <Button Content="✓ Accept"
+                                        Style="{StaticResource ActionButton}"
+                                        Background="#27AE60" Foreground="White"
+                                        BorderBrush="#1E8449"
+                                        Command="{Binding AcceptMatchCommand}"/>
+
+                                <Button Content="✗ Reject"
+                                        Style="{StaticResource ActionButton}"
+                                        Background="#E74C3C" Foreground="White"
+                                        BorderBrush="#CB4335"
+                                        Command="{Binding RejectMatchCommand}"/>
+
+                                <Button Content="↗ Assign manually…"
+                                        Style="{StaticResource ActionButton}"
+                                        Command="{Binding AssignManuallyCommand}"/>
+                            </StackPanel>
+
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+
+            <GridSplitter Grid.Column="3" Width="5" HorizontalAlignment="Stretch"
+                          Background="{StaticResource BorderBrush}" ResizeBehavior="PreviousAndNext"/>
+
+            <!-- ── RIGHT: Excel Values ─────────────────────────────────── -->
+            <Border Grid.Column="4"
+                    Background="{StaticResource PanelBg}"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="1,0,0,0">
+                <DockPanel>
+                    <TextBlock DockPanel.Dock="Top"
+                               Text="Excel Values"
+                               Background="{StaticResource HeaderBrush}"
+                               Foreground="White"
+                               FontWeight="SemiBold"
+                               Padding="8,5"/>
+
+                    <!-- Filter row -->
+                    <StackPanel DockPanel.Dock="Top"
+                                Orientation="Horizontal"
+                                Margin="6,4"
+                                VerticalAlignment="Center">
+                        <CheckBox Content="Show unmatched only"
+                                  IsChecked="{Binding ShowUnmatchedOnly}"
+                                  FontSize="11"/>
+                    </StackPanel>
+
+                    <DataGrid ItemsSource="{Binding ExcelValues}"
+                              AutoGenerateColumns="False"
+                              IsReadOnly="True"
+                              CanUserReorderColumns="False"
+                              CanUserResizeRows="False"
+                              SelectionMode="Single"
+                              SelectedItem="{Binding SelectedExcelCell}"
+                              GridLinesVisibility="Horizontal"
+                              BorderThickness="0"
+                              RowHeaderWidth="0"
+                              FontSize="11">
+
+                        <DataGrid.RowStyle>
+                            <Style TargetType="DataGridRow">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsUsed}" Value="False">
+                                        <Setter Property="Background" Value="#FDEDEC"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DataGrid.RowStyle>
+
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Cell"   Binding="{Binding CellAddress}"  Width="48"/>
+                            <DataGridTextColumn Header="Value"  Binding="{Binding Value}"         Width="*"/>
+                            <DataGridTextColumn Header="Status" Binding="{Binding StatusText}"    Width="68"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </Border>
+
+        </Grid>
+    </DockPanel>
+</Window>
